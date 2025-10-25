@@ -7,12 +7,8 @@ import warnings
 import time
 warnings.filterwarnings("ignore")
 
-# ==========================
-# CONFIGURATION
-# ==========================
 FRED_API_KEY = "cf6a075550a88f00f3a045cd7a70cd46"
 fred = Fred(api_key=FRED_API_KEY)
-
 # ==========================
 # FETCH DATA FUNCTIONS
 # ==========================
@@ -76,7 +72,6 @@ def fetch_yield_curve(start="2010-01-01", end=None):
     yc.name = "Yield_Curve"
     yc = yc.loc[start:end]
     return yc
-
 # ==========================
 # COMPUTATION FUNCTIONS
 # ==========================
@@ -244,7 +239,6 @@ def backtest(ticker, start="2015-01-01", end=None):
     print(f"Max Drawdown (Strategy): {max_drawdown:.2%}")
     print(f"Number of Trades: {num_trades}")
     print("===============================")
-
     return results
 
 # ==========================
@@ -321,4 +315,5 @@ def main():
 # RUN
 # ==========================
 if __name__ == "__main__":
+
     main()
