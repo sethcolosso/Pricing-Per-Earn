@@ -1,293 +1,241 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from fredapi import Fred
 from datetime import datetime
+import matplotlib.pyplot as plt
+import requests
+from io import BytesIO
 import warnings
 import time
 warnings.filterwarnings("ignore")
 
 # ==========================
-# CONFIGURATION
+# CONFIG
 # ==========================
-FRED_API_KEY = "cf6a075550a88f00f3a045cd7a70cd46"
-fred = Fred(api_key=FRED_API_KEY)
+SHILLER_URL = "http://www.econ.yale.edu/~shiller/data/ie_data.xls"
 
 # ==========================
-# FETCH DATA FUNCTIONS
+# FETCH DATA
 # ==========================
-def fetch_asset_data(ticker, start="2010-01-01", end=None):
-    """Fetch price data with robust handling"""
-    print(f"Fetching data for {ticker} from {start} to {end or 'today'} ...")
-    for attempt in range(3):
+def fetch_price(ticker, start, end=None):
+    print(f"Fetching price for {ticker}...")
+    end = end or datetime.today().strftime('%Y-%m-%d')
+    for _ in range(3):
         try:
-            data = yf.download(ticker, start=start, end=end, progress=False)
-            # Handle MultiIndex
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.get_level_values(0)
-            # Ensure 'Adj Close' exists
-            if 'Adj Close' not in data.columns:
-                if 'Close' in data.columns:
-                    data['Adj Close'] = data['Close']
-                else:
-                    raise KeyError("No price data found")
-            data = data[['Adj Close']].copy()
-            data["Adj Close"] = data["Adj Close"].ffill().bfill()
-            if len(data) > 0:
-                print(f"Success: Fetched {len(data)} days of data.")
-                return data
-            else:
-                print("Empty data, retrying...")
+            data = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+            if data.empty:
+                raise ValueError("Empty data")
+            data = data[['Close']].copy()
+            data.rename(columns={'Close': 'Price'}, inplace=True)
+            print(f"Success: {len(data)} days")
+            return data
         except Exception as e:
-            print(f"Attempt {attempt+1} failed: {e}")
-        time.sleep(3)
-    raise ValueError(f"Failed to fetch data for {ticker} after 3 attempts.")
+            print(f"Retry... {e}")
+            time.sleep(3)
+    raise ValueError("Price fetch failed")
 
 def fetch_earnings(ticker, start, end=None):
-    """Fetch quarterly earnings and resample to daily"""
-    print(f"Fetching earnings for {ticker} ...")
+    print(f"Fetching earnings for {ticker}...")
+    end = end or datetime.today().strftime('%Y-%m-%d')
     try:
         stock = yf.Ticker(ticker)
         earnings = stock.quarterly_earnings
-        if earnings.empty or 'Earnings' not in earnings.columns:
-            print(f"No earnings data for {ticker}. Using trailing EPS or default.")
-            return None
-        # Ensure index is datetime
-        earnings['Date'] = pd.to_datetime(earnings.index)
-        earnings = earnings.set_index('Date')['Earnings']
-        # Resample to daily
-        date_range = pd.date_range(start=start, end=end or datetime.today(), freq='D')
-        earnings_daily = earnings.reindex(date_range).ffill()
-        if earnings_daily.empty:
-            return None
-        return earnings_daily
+        if earnings is None or earnings.empty:
+            raise ValueError("No data")
+        earnings = earnings.copy()
+        earnings.index = pd.to_datetime(earnings.index)
+        earnings = earnings[['Earnings']]
+        full_range = pd.date_range(start=start, end=end, freq='D')
+        daily = earnings.reindex(full_range).ffill()
+        print(f"Earnings: {len(earnings)} quarters")
+        return daily
     except Exception as e:
-        print(f"Failed to fetch earnings for {ticker}: {e}")
+        print(f"Earnings failed: {e}. Using trailing EPS...")
+        try:
+            eps = stock.info.get('trailingEps', 6.0)
+            series = pd.Series(eps, index=pd.date_range(start=start, end=end, freq='D'))
+            print(f"Trailing EPS: {eps:.2f}")
+            return series
+        except:
+            return None
+
+def fetch_shiller_cape(start, end=None):
+    print("Fetching Shiller CAPE...")
+    end = end or datetime.today().strftime('%Y-%m-%d')
+    try:
+        response = requests.get(SHILLER_URL, timeout=10)
+        df = pd.read_excel(BytesIO(response.content), sheet_name="Data", skiprows=7)
+        df = df.iloc[:, [0, 7]]
+        df.columns = ['Date', 'CAPE']
+        df['Date'] = pd.to_datetime(df['Date'].astype(str).str.split('.').str[0] + '-01')
+        df = df.set_index('Date').dropna()
+        full = pd.date_range(start=start, end=end, freq='D')
+        cape = df['CAPE'].reindex(full).ffill()
+        print(f"CAPE: {len(df)} months")
+        return cape
+    except Exception as e:
+        print(f"CAPE failed: {e}")
         return None
 
-def fetch_vix_data(start, end=None):
-    """Fetch CBOE VIX data"""
-    print("Fetching VIX data ...")
+def fetch_vix(start, end=None):
+    print("Fetching VIX...")
+    end = end or datetime.today().strftime('%Y-%m-%d')
     try:
-        vix = yf.download("^VIX", start=start, end=end, progress=False)
-        vix_series = vix["Close"]
-        vix_series.name = "VIX"
-        return vix_series
+        vix = yf.download("^VIX", start=start, end=end, progress=False)['Close']
+        vix.name = 'VIX'
+        return vix
     except:
-        print("Failed to fetch VIX data.")
-        return None
+        print("VIX fallback")
+        return pd.Series(20.0, index=pd.date_range(start=start, end=end, freq='D'))
 
 def fetch_yield_curve(start, end=None):
-    """Fetch 10Y minus 2Y Treasury yield spread"""
-    print("Fetching yield curve data from FRED ...")
+    print("Fetching Yield Curve...")
+    end = end or datetime.today().strftime('%Y-%m-%d')
     try:
-        t10y = fred.get_series("DGS10")
-        t2y = fred.get_series("DGS2")
-        yc = (t10y - t2y).dropna()
-        yc.name = "Yield_Curve"
-        yc = yc.loc[start:end]
+        t10 = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10", parse_dates=['DATE'])
+        t2 = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2", parse_dates=['DATE'])
+        yc = t10.set_index('DATE')['DGS10'] - t2.set_index('DATE')['DGS2']
+        yc = yc.reindex(pd.date_range(start=start, end=end, freq='D')).ffill()
+        yc.name = 'Yield_Curve'
         return yc
     except:
-        print("Failed to fetch yield curve data.")
-        return None
-
-def fetch_current_data(ticker):
-    """Fetch current price, EPS, VIX, and yield curve"""
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        # Use provided price for AAPL if available
-        price = 262.82 if ticker == "AAPL" else info.get('regularMarketPrice', info.get('currentPrice'))
-        eps = info.get('trailingEps')
-        vix = yf.Ticker("^VIX").info.get('regularMarketPrice', np.nan)
-        t10y = fred.get_series("DGS10").iloc[-1]
-        t2y = fred.get_series("DGS2").iloc[-1]
-        yc = t10y - t2y
-        return price, eps, vix, yc
-    except Exception as e:
-        print(f"Failed to fetch current data: {e}")
-        return None, None, np.nan, np.nan
+        print("Yield curve fallback")
+        return pd.Series(0.5, index=pd.date_range(start=start, end=end, freq='D'))
 
 # ==========================
-# COMPUTATION FUNCTIONS
+# SIGNAL
 # ==========================
-def compute_pe_ratio(price, eps, prev_pe=None, prev_prev_pe=None):
-    """Compute P/E with fallbacks to previous day or average of past two days"""
-    if eps and eps != 0 and not np.isnan(eps):
-        return price / eps
-    print("⚠️ EPS missing — using previous P/E or average")
-    if prev_pe is not None and not np.isnan(prev_pe):
-        return prev_pe
-    if prev_pe is not None and prev_prev_pe is not None:
-        return np.mean([prev_pe, prev_prev_pe])
-    return 20.0  # Default if no data
-
-def generate_signal(pe, vix, yield_curve):
-    """Generate trading signal based on P/E, VIX, and Yield Curve"""
+def generate_signal(pe, vix, yc):
     score = 0
-    if pe is not None and not np.isnan(pe):
-        if pe < 15:
-            score += 1
-        elif pe > 25:
-            score -= 1
-    if vix is not None and not np.isnan(vix):
-        if vix < 15:
-            score += 1
-        elif vix > 25:
-            score -= 1
-    if yield_curve is not None and not np.isnan(yield_curve):
-        if yield_curve > 0:
-            score += 1
-        else:
-            score -= 1
-    if score >= 2:
-        signal = "BUY"
-    elif score <= -1:
-        signal = "SELL"
-    else:
-        signal = "HOLD"
-    return score, signal
+    if pe < 15: score += 1
+    elif pe > 25: score -= 1
+    if vix < 15: score += 1
+    elif vix > 25: score -= 1
+    if yc > 0: score += 1
+    else: score -= 1
+    if score >= 2: return score, "BUY"
+    elif score <= -1: return score, "SELL"
+    else: return score, "HOLD"
 
-def backtest(ticker, start, end=None):
-    """Run backtest with statistical analysis and risk management"""
-    print("Starting backtest...")
-    # Fetch data
-    data = fetch_asset_data(ticker, start, end)
-    earnings = fetch_earnings(ticker, start, end)
-    vix = fetch_vix_data(start, end)
+# ==========================
+# BACKTEST
+# ==========================
+def backtest(ticker, start, end=None, plot=True):
+    end = end or datetime.today().strftime('%Y-%m-%d')
+    print("\n" + "="*60)
+    print("BACKTEST STARTED")
+    print("="*60)
+    
+    price = fetch_price(ticker, start, end)
+    vix = fetch_vix(start, end)
     yc = fetch_yield_curve(start, end)
+    
+    # P/E
+    if ticker in ['SPY', '^GSPC']:
+        pe_series = fetch_shiller_cape(start, end)
+        use_cape = True
+    else:
+        eps = fetch_earnings(ticker, start, end)
+        pe_series = None
+        use_cape = False
 
-    # Merge data
-    df = pd.DataFrame(index=data.index)
-    df["Price"] = data["Adj Close"]
-    if earnings is not None:
-        df = df.join(earnings.rename("EPS"), how="left")
-    if vix is not None:
-        df = df.join(vix, how="inner")
-    if yc is not None:
-        df = df.join(yc, how="inner")
+    df = price.copy()
+    df['VIX'] = vix.reindex(df.index).ffill().bfill()
+    df['Yield_Curve'] = yc.reindex(df.index).ffill().bfill()
 
-    # Handle missing data
-    if 'EPS' not in df.columns:
-        df['EPS'] = np.nan
-    if 'VIX' not in df.columns:
-        df['VIX'] = np.nan
-    if 'Yield_Curve' not in df.columns:
-        df['Yield_Curve'] = np.nan
+    if use_cape and pe_series is not None:
+        df['PE'] = pe_series.reindex(df.index).ffill()
+    else:
+        df['EPS'] = eps.reindex(df.index).ffill() if eps is not None else np.nan
+        df['PE'] = np.nan
+        prev = None
+        for i in range(len(df)):
+            eps_val = df['EPS'].iloc[i]
+            pe = df['Price'].iloc[i] / eps_val if pd.notna(eps_val) and eps_val > 0 else (prev or 20.0)
+            df.iloc[i, df.columns.get_loc('PE')] = pe
+            prev = pe
 
-    # Compute P/E
-    df['PE'] = np.nan
-    prev_pe = None
-    prev_prev_pe = None
-    for i, row in df.iterrows():
-        pe = compute_pe_ratio(row['Price'], row.get('EPS'), prev_pe, prev_prev_pe)
-        df.loc[i, 'PE'] = pe
-        prev_prev_pe = prev_pe
-        prev_pe = pe
+    # Signals
+    df['Signal'] = 'HOLD'
+    for i in range(len(df)):
+        _, sig = generate_signal(df['PE'].iloc[i], df['VIX'].iloc[i], df['Yield_Curve'].iloc[i])
+        df.iloc[i, df.columns.get_loc('Signal')] = sig
 
-    # Generate signals
-    df['Score'] = 0
-    df['Signal'] = "HOLD"
-    for i, row in df.iterrows():
-        score, signal = generate_signal(row['PE'], row.get('VIX'), row.get('Yield_Curve'))
-        df.loc[i, 'Score'] = score
-        df.loc[i, 'Signal'] = signal
+    # Backtest
+    df['Return'] = df['Price'].pct_change().fillna(0)
+    df['Strategy'] = 0.0
+    in_pos = False
+    cost = 0.001
+    trades = 0
 
-    # Backtest with risk management
-    transaction_cost = 0.001  # 0.1% per trade
-    df['Market_Return'] = df['Price'].pct_change().fillna(0)
-    df['Strategy_Return'] = 0.0
-    in_position = False
-    num_trades = 0
     for i in range(1, len(df)):
-        signal = df['Signal'].iloc[i-1]
-        current_return = df['Market_Return'].iloc[i]
-        strategy_return = 0.0
-        if signal == "BUY" and not in_position:
-            in_position = True
-            num_trades += 1
-            strategy_return = current_return - transaction_cost
-        elif signal == "SELL" and in_position:
-            in_position = False
-            num_trades += 1
-            strategy_return = current_return - transaction_cost
-        elif in_position:
-            strategy_return = current_return
-            # Risk management: 5% stop-loss
-            if current_return < -0.05:
-                strategy_return -= transaction_cost
-                in_position = False
-                num_trades += 1
-        df.loc[df.index[i], 'Strategy_Return'] = strategy_return
+        sig = df['Signal'].iloc[i-1]
+        ret = df['Return'].iloc[i]
+        strat = 0.0
+        if sig == "BUY" and not in_pos:
+            in_pos = True
+            trades += 1
+            strat = ret - cost
+        elif sig == "SELL" and in_pos:
+            in_pos = False
+            trades += 1
+            strat = ret - cost
+        elif in_pos:
+            strat = ret
+            if ret < -0.05:
+                strat -= cost
+                in_pos = False
+                trades += 1
+        df.iloc[i, df.columns.get_loc('Strategy')] = strat
 
-    # Calculate statistics
-    df['Cumulative_Market'] = (1 + df['Market_Return']).cumprod()
-    df['Cumulative_Strategy'] = (1 + df['Strategy_Return']).cumprod()
-    total_return_strategy = df['Cumulative_Strategy'].iloc[-1] - 1
-    total_return_market = df['Cumulative_Market'].iloc[-1] - 1
-    num_days = len(df)
-    annual_return_strategy = (1 + total_return_strategy) ** (252 / num_days) - 1 if num_days > 0 else 0
-    annual_return_market = (1 + total_return_market) ** (252 / num_days) - 1 if num_days > 0 else 0
-    annual_vol_strategy = df['Strategy_Return'].std() * np.sqrt(252) if num_days > 1 else 0
-    sharpe_strategy = annual_return_strategy / annual_vol_strategy if annual_vol_strategy != 0 else 0
-    peak = df['Cumulative_Strategy'].cummax()
-    drawdown = (df['Cumulative_Strategy'] - peak) / peak
-    max_drawdown = drawdown.min()
+    df['Cum_Strat'] = (1 + df['Strategy']).cumprod()
+    df['Cum_Market'] = (1 + df['Return']).cumprod()
 
-    # Print stats
-    print("\n===== BACKTEST STATISTICS =====")
-    print(f"Total Return (Strategy): {total_return_strategy:.2%}")
-    print(f"Total Return (Buy & Hold): {total_return_market:.2%}")
-    print(f"Annualized Return (Strategy): {annual_return_strategy:.2%}")
-    print(f"Annualized Return (Buy & Hold): {annual_return_market:.2%}")
-    print(f"Annualized Volatility (Strategy): {annual_vol_strategy:.2%}")
-    print(f"Sharpe Ratio (Strategy): {sharpe_strategy:.2f}")
-    print(f"Max Drawdown (Strategy): {max_drawdown:.2%}")
-    print(f"Number of Trades: {num_trades}")
-    print("===============================")
+    total = df['Cum_Strat'].iloc[-1] - 1
+    market = df['Cum_Market'].iloc[-1] - 1
+    days = len(df)
+    ann = (1 + total) ** (252/days) - 1 if days else 0
+    vol = df['Strategy'].std() * np.sqrt(252)
+    sharpe = ann / vol if vol > 0 else 0
+    dd = (df['Cum_Strat'] / df['Cum_Strat'].cummax() - 1).min()
+
+    print("\nRESULTS")
+    print(f"Total Return: {total:+.2%}")
+    print(f"Buy & Hold: {market:+.2%}")
+    print(f"Annualized: {ann:+.2%}")
+    print(f"Sharpe: {sharpe:.2f}")
+    print(f"Max DD: {dd:.2%}")
+    print(f"Trades: {trades}")
+
+    if plot:
+        plt.figure(figsize=(12,6))
+        plt.plot(df.index, df['Cum_Strat'], label='Strategy', color='blue')
+        plt.plot(df.index, df['Cum_Market'], label='Buy & Hold', color='gray')
+        plt.title(f'{ticker} Backtest')
+        plt.legend()
+        plt.grid()
+        plt.tight_layout()
+        plt.savefig(f"{ticker}_curve.png")
+        plt.show()
 
     return df
 
 # ==========================
-# MAIN EXECUTION
+# MAIN
 # ==========================
 def main():
     print("Market Sentiment Backtester")
-    print("="*50)
-    ticker = input("Enter ticker Symbol (e.g., AAPL, SPY, ^GSPC): ").strip().upper()
-    start = input("Start date (YYYY-MM-DD, default 2015-01-01): ").strip() or "2015-01-01"
-    end = None  # Current date
+    print("="*60)
+    ticker = input("Ticker: ").strip().upper()
+    start = input("Start (YYYY-MM-DD): ").strip() or "2015-01-01"
 
     try:
-        results = backtest(ticker, start, end)
+        results = backtest(ticker, start)
         last = results.iloc[-1]
-        print("\n===== MOST RECENT ANALYSIS =====")
-        print(f"Ticker: {ticker}")
-        print(f"P/E Ratio: {last['PE']:.2f}")
-        print(f"VIX: {last['VIX']:.2f}" if not np.isnan(last.get('VIX')) else "VIX: Unavailable")
-        print(f"Yield Curve (10Y-2Y): {last['Yield_Curve']:.2f}" if not np.isnan(last.get('Yield_Curve')) else "Yield Curve: Unavailable")
-        print(f"Market Sentiment Score: {int(last['Score'])}")
-        print(f"Trade Signal: 🚀 {last['Signal']}")
-        print("================================")
-        results.to_csv(f"{ticker}_PE_VIX_YieldCurve_Backtest.csv")
-        print(f"\nBacktest results saved as {ticker}_PE_VIX_YieldCurve_Backtest.csv")
+        print(f"\nSIGNAL: {last['Signal']} | P/E: {last['PE']:.1f}")
     except Exception as e:
-        print(f"Error: Cannot access historical data for {ticker}. {e}")
-        print("Proceeding with limited current analysis...")
-        price, eps, vix, yc = fetch_current_data(ticker)
-        if price is None:
-            print("Unable to fetch current price. Aborting.")
-            return
-        pe = compute_pe_ratio(price, eps)
-        score, signal = generate_signal(pe, vix, yc)
-        print("\n===== LIMITED CURRENT ANALYSIS (NO BACKTEST) =====")
-        print(f"Ticker: {ticker}")
-        print(f"Current Price: ${price:.2f}")
-        print(f"P/E Ratio (approx): {pe:.2f}")
-        print(f"VIX: {vix:.2f}" if not np.isnan(vix) else "VIX: Unavailable")
-        print(f"Yield Curve (10Y-2Y): {yc:.2f}" if not np.isnan(yc) else "Yield Curve: Unavailable")
-        print(f"Market Sentiment Score: {score}")
-        print(f"Trade Signal: 🚀 {signal}")
-        print("================================")
+        print(f"Error: {e}")
+        print("Try again in 5 mins")
+
 if __name__ == "__main__":
     main()
