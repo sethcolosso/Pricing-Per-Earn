@@ -103,18 +103,19 @@ def fetch_yield_curve(start, end=None):
         return pd.Series(0.5, index=pd.date_range(start=start, end=end, freq='D'))
 
 # ==========================
-# SIGNAL
+# ENHANCED SIGNAL
 # ==========================
-def generate_signal(pe, vix, yc):
+def generate_signal(pe, vix, yc, rsi):
     score = 0
-    if pe < 15: score += 1
-    elif pe > 25: score -= 1
-    if vix < 15: score += 1
-    elif vix > 25: score -= 1
-    if yc > 0: score += 1
-    else: score -= 1
+    if pe < 30: score += 1
+    elif pe > 40: score -= 1
+    if vix < 18: score += 1
+    elif vix > 30: score -= 1
+    if yc > 0.3: score += 1
+    if rsi < 30: score += 1
+    if rsi > 70: score -= 1
     if score >= 2: return score, "BUY"
-    elif score <= -1: return score, "SELL"
+    elif score <= -2: return score, "SELL"
     else: return score, "HOLD"
 
 # ==========================
@@ -130,38 +131,37 @@ def backtest(ticker, start, end=None, plot=True):
     vix = fetch_vix(start, end)
     yc = fetch_yield_curve(start, end)
     
-    # P/E
-    if ticker in ['SPY', '^GSPC']:
-        pe_series = fetch_shiller_cape(start, end)
-        use_cape = True
-    else:
-        eps = fetch_earnings(ticker, start, end)
-        pe_series = None
-        use_cape = False
+    try:
+        stock = yf.Ticker(ticker)
+        eps = stock.info.get('trailingEps', 6.0)
+        print(f"Using trailing EPS: {eps:.2f}")
+    except:
+        eps = 6.0
+        print("Using default EPS: 6.0")
 
     df = price.copy()
+    df['EPS'] = eps
+    df['PE'] = df['Price'] / eps
+
     df['VIX'] = vix.reindex(df.index).ffill().bfill()
     df['Yield_Curve'] = yc.reindex(df.index).ffill().bfill()
 
-    if use_cape and pe_series is not None:
-        df['PE'] = pe_series.reindex(df.index).ffill()
-    else:
-        df['EPS'] = eps.reindex(df.index).ffill() if eps is not None else np.nan
-        df['PE'] = np.nan
-        prev = None
-        for i in range(len(df)):
-            eps_val = df['EPS'].iloc[i]
-            pe = df['Price'].iloc[i] / eps_val if pd.notna(eps_val) and eps_val > 0 else (prev or 20.0)
-            df.iloc[i, df.columns.get_loc('PE')] = pe
-            prev = pe
+    delta = df['Price'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    df['RSI'] = df['RSI'].fillna(50)
 
-    # Signals
     df['Signal'] = 'HOLD'
     for i in range(len(df)):
-        _, sig = generate_signal(df['PE'].iloc[i], df['VIX'].iloc[i], df['Yield_Curve'].iloc[i])
+        pe = df['PE'].iloc[i]
+        vix_val = df['VIX'].iloc[i]
+        yc_val = df['Yield_Curve'].iloc[i]
+        rsi = df['RSI'].iloc[i]
+        _, sig = generate_signal(pe, vix_val, yc_val, rsi)
         df.iloc[i, df.columns.get_loc('Signal')] = sig
 
-    # Backtest
     df['Return'] = df['Price'].pct_change().fillna(0)
     df['Strategy'] = 0.0
     in_pos = False
@@ -199,32 +199,49 @@ def backtest(ticker, start, end=None, plot=True):
     sharpe = ann / vol if vol > 0 else 0
     dd = (df['Cum_Strat'] / df['Cum_Strat'].cummax() - 1).min()
 
-    print("\nRESULTS")
+    print("\n" + "="*50)
+    print("RESULTS")
+    print("="*50)
+    print(f"Period: {start} to {end}")
     print(f"Total Return: {total:+.2%}")
     print(f"Buy & Hold: {market:+.2%}")
     print(f"Annualized: {ann:+.2%}")
     print(f"Sharpe: {sharpe:.2f}")
-    print(f"Max DD: {dd:.2%}")
+    print(f"Max Drawdown: {dd:.2%}")
     print(f"Trades: {trades}")
+    print("="*50)
 
     if plot:
-        plt.figure(figsize=(12,6))
-        plt.plot(df.index, df['Cum_Strat'], label='Strategy', color='blue')
-        plt.plot(df.index, df['Cum_Market'], label='Buy & Hold', color='gray')
-        plt.title(f'{ticker} Backtest')
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 1, 1)
+        plt.plot(df.index, df['Cum_Strat'], label='Strategy', color='blue', linewidth=2)
+        plt.plot(df.index, df['Cum_Market'], label='Buy & Hold', color='gray', alpha=0.7)
+        plt.title(f'{ticker} Strategy vs Buy & Hold')
+        plt.ylabel('Cumulative Return')
         plt.legend()
-        plt.grid()
+        plt.grid(True)
+
+        plt.subplot(2, 1, 2)
+        plt.plot(df.index, df['PE'], label='P/E Ratio', color='purple')
+        plt.axhline(30, color='green', linestyle='--', label='Buy Zone')
+        plt.axhline(40, color='red', linestyle='--', label='Sell Zone')
+        plt.title('P/E Ratio Over Time')
+        plt.ylabel('P/E')
+        plt.legend()
+        plt.grid(True)
+
         plt.tight_layout()
-        plt.savefig(f"{ticker}_curve.png")
+        plt.savefig(f"{ticker}_backtest.png", dpi=150)
         plt.show()
+        print(f"Plot saved: {ticker}_backtest.png")
 
     return df
 
 # ==========================
-# MAIN
+# MAIN (FIXED PRINT ERROR)
 # ==========================
 def main():
-    print("Market Sentiment Backtester")
+    print("Market Sentiment Backtester (P/E + VIX + Yield Curve + RSI)")
     print("="*60)
     ticker = input("Ticker: ").strip().upper()
     start = input("Start (YYYY-MM-DD): ").strip() or "2015-01-01"
@@ -232,10 +249,12 @@ def main():
     try:
         results = backtest(ticker, start)
         last = results.iloc[-1]
-        print(f"\nSIGNAL: {last['Signal']} | P/E: {last['PE']:.1f}")
+        pe = last['PE'].item() if isinstance(last['PE'], (pd.Series, np.generic)) else last['PE']
+        rsi = last['RSI'].item() if isinstance(last['RSI'], (pd.Series, np.generic)) else last['RSI']
+        print(f"\nLATEST SIGNAL: {last['Signal']} | P/E: {pe:.1f} | RSI: {rsi:.0f}")
     except Exception as e:
         print(f"Error: {e}")
-        print("Try again in 5 mins")
+        print("Try again in 5 minutes.")
 
 if __name__ == "__main__":
     main()
